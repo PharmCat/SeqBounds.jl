@@ -1,21 +1,60 @@
-
 #SeqBounds.jl
 struct SeqBoundsResult
     sf::String
     v::Vector
     alpha::Float64
+    side::Int
+    za::Vector
     zb::Vector
     asfv::Vector
     asfvdiff::Vector
     stdv::Vector
     sdproc::Vector
 end
-
-function obf(p, alpha)
-    2(1 - cdf(Normal(), quantile(Normal(), 1-alpha/2)/sqrt(p)))
+function obf(p, alpha, side)
+    2(1 - cdf(Normal(), quantile(Normal(), 1 - alpha/side/2)/sqrt(p)))
+end
+function pocock(p, alpha, side)
+    (alpha/side)*log(1+(exp(1)-1)*p)
+end
+function power(p, alpha, side; γ = 1)
+    alpha/side*p^γ
 end
 
-function bounds(v::Vector, alpha::Float64; h::Float64 = 0.05)
+"""
+    bounds(v::Vector, alpha::Float64; side = :one, asf = :obf, h::Float64 = 0.05)
+
+* `v` - vector of onformation portion;
+* `alpha` - total alpha level;
+* `side` - one- or two- sided test (:one or :two);
+* `asf` - alpha spending function (:obf, :pocock, :power, :ep);
+* `h` - integration grid multiplier.
+
+# Example
+
+bounds([0.2, 0.4, 0.6, 0.8, 1.0], 0.05; side = :one, asf = :obf)
+
+Maximum `v` shoul be less 1, i-th element shod be less i+1.
+Alpha shoul be in range > 0.0 and < 1.0.
+
+# asf:
+
+`:obf` - O'Brien-Fleming function
+
+2(1 - cdf(Normal(), quantile(Normal(), 1 - α / side / 2)/sqrt(t)))
+
+`:pocock` - Pocock function.
+
+α / side * log(1 + (exp(1) - 1) * t)
+
+`:power` - power function.
+
+α / side * t^γ
+
+`:ep` - equal parts.
+
+"""
+function bounds(v::Vector, alpha::Float64; side = :one, asf = :obf, h::Float64 = 0.05)
     if alpha ≥ 1 || alpha ≤ 0 error("alpha should be in range: 0 < alpha < 1!") end
     if v[end] > 1 error("Last value of v shoul be  ≤ 1!") end
     if length(v) > 1
@@ -23,9 +62,24 @@ function bounds(v::Vector, alpha::Float64; h::Float64 = 0.05)
             if !(v[i] > v[i-1])  error("v[i] shoul be > v[i-1]") end
         end
     end
+    if side == :one side = 1 elseif side == :two side  = 2 end
+    if asf == :obf
+        asfv   = obf.(v, alpha, side) * side
+        asfstr = "O'Brien-Fleming"
+    elseif asf == :pocock
+        asfv   = pocock.(v, alpha, side) * side
+        asfstr = "Pocock"
+    elseif asf == :power
+        asfv   = power.(v, alpha, side) * side
+        asfstr = "Power"
+    elseif asf == :ep
+        asfv   = collect(1:length(v)) * (alpha/length(v))
+        asfstr = "Equal parts"
+    else
+        error("uncknown function")
+    end
+    #
     zninf       = -8.0
-    side        = 1
-    asfv        = obf.(v, alpha) # Alpha spending function values
     asfvdiff    = similar(asfv)
     vdiff       = similar(v)
     asfvdiff[1] = asfv[1]
@@ -43,38 +97,36 @@ function bounds(v::Vector, alpha::Float64; h::Float64 = 0.05)
     nints = zeros(Int, length(v))
     grids = Vector{StepRangeLen}(undef, length(v))
     #
-    za[1] = zninf # For one side
     zb[1] = quantile(Normal(), 1-asfvdiff[1]/side)
-    ya[1] = za[1]*stdv[1]
     yb[1] = zb[1]*stdv[1]
-
+    if side == 1 # For one side
+        za[1] = zninf
+        ya[1] = za[1]*stdv[1]
+    else
+        za[1] = -zb[1]
+        ya[1] = -yb[1]
+    end
     nints[1] = ceil((yb[1] - ya[1])/(h*stdv[1]))
     grids[1] = range(ya[1], yb[1], length=nints[1] + 1)
     last     = pdf.(Normal(0, stdv[1]), grids[1])
-
     for i = 2:length(v)
-        if i > 2
-            # For next step
+        if i > 2 # For next step
             nints[i-1] = ceil((yb[i-1]-ya[i-1])/(h*stdv[i-1]))
             grids[i-1] = range(ya[i-1], yb[i-1], length=nints[i-1]+1)
             last     = highordgrid(last, grids[i-1], grids[i-2], stdv[i-1])
         end
-
-        za[i]    = zninf
-        ya[i]    = zninf*sdproc[i]
-        zerof    = x -> asfvdiff[i] - integrategrid(x, last, grids[i-1], stdv[i])
-
+        zerof    = x -> asfvdiff[i]/side - integrategrid(x, last, grids[i-1], stdv[i])
         yb[i]    = find_zero(zerof, (0.0, zb[i-1]))
         zb[i]    = yb[i]/sdproc[i]
+        if side == 1
+            za[i]    = zninf
+            ya[i]    = zninf*sdproc[i]
+        else
+            ya[i]    = -yb[i]
+            za[i]    = -zb[i]
+        end
     end
-    SeqBoundsResult("O'Brien-Fleming",
-    v,
-    alpha,
-    zb,
-    asfv,
-    asfvdiff,
-    stdv,
-    sdproc)
+    SeqBoundsResult(asfstr, v, alpha, side, za, zb, asfv, asfvdiff, stdv, sdproc)
 end
 
 function integrategrid(x, last::Vector{T}, grid, stdv) where T
@@ -104,9 +156,15 @@ function highordgrid(last::Vector{T}, x, grid, stdv) where T
 end
 
 function Base.show(io::IO, obj::SeqBoundsResult)
-    println(io, """One-sided group sequential design
+    if obj.side == 1
+        println(io, """One-sided group sequential design
     Alpha spending function: $(obj.sf),  Alpha = $(obj.alpha)""")
-    pretty_table(io, hcat(obj.v, obj.asfv, obj.asfvdiff, obj.zb, ccdf.(Normal(), obj.zb)); header = ["Portion", "Function value", "Spend", "Z", "Nominal p"])
+            pretty_table(io, hcat(obj.v, obj.asfv, obj.asfvdiff, obj.zb, ccdf.(Normal(), obj.zb)); header = ["Portion", "Function value", "Spend", "Z", "Nominal p"])
+    else
+        println(io, """Two-sided group sequential design
+    Alpha spending function: $(obj.sf),  Alpha = $(obj.alpha)""")
+            pretty_table(io, hcat(obj.v, obj.asfv, obj.asfvdiff, obj.za, obj.zb, ccdf.(Normal(), obj.zb)); header = ["Portion", "Function value", "Spend", "Zl", "Zu", "Nominal p"])
+    end
 end
 ################################################################################
 #=
